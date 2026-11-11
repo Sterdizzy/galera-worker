@@ -1,3 +1,5 @@
+import { PreparedCredential, exactOrigin, credentialField, guardFailure, vaultCapabilities, type CredentialField } from './vault-guard';
+import { CredentialPrivacy } from './vault-privacy';
 import { within, navigateResponsive, captureResponsive } from './browser-resilience';
 import { pageLiveView, type LiveViewCache } from "./live-view";
 import { acquire, connect, type Browser, type BrowserContext, type Page, type Route, type Request as PlaywrightRequest } from "@cloudflare/playwright";
@@ -56,6 +58,7 @@ export interface BrowserActionResult {
   visualArtifact?: BrowserVisualArtifact;
   browserObservation?: BrowserObservation;
   browserOutcome?: BrowserActionOutcome;
+  privateLiveViewUrl?: string;
 }
 
 export type ActionClaim =
@@ -66,6 +69,67 @@ export type ActionClaim =
 
 export class GratisSandbox extends Sandbox<Env> {
   private readonly gratisEnv: Env;
+  private privacy = new CredentialPrivacy();
+  private browserQueue: Promise<unknown> = Promise.resolve();
+  private credentialChallenges = new Map<string, { target: PreparedCredential; page: Page; sessionId: string; generation: number; expiresAt: number; origin: string; field: CredentialField }>();
+  private queueBrowser<T>(op: () => Promise<T>): Promise<T> {
+    const next = this.browserQueue.catch(() => {}).then(op);
+    this.browserQueue = next;
+    return next;
+  }
+  private credentialOrigin(): string | undefined {
+    return this.ctx.storage.sql.exec<{ origin: string }>('SELECT origin FROM credential_privacy WHERE singleton=1').toArray()[0]?.origin;
+  }
+  /** Persist only the irreversible privacy latch and public origin, never a credential value. */
+  private markCredential(value: string, origin: string) {
+    this.ctx.storage.sql.exec('INSERT OR REPLACE INTO credential_privacy(singleton,origin) VALUES(1,?)', origin);
+    this.privacy.add(value);
+  }
+  async protectResult<T extends BrowserActionResult>(result: T): Promise<T> {
+    if (!this.privacy.latched) return result;
+    const privateLiveViewUrl = result.privateLiveViewUrl || result.visualArtifact?.liveViewUrl;
+    const output = result.output.startsWith('Sandbox action failed:') ? 'Sandbox action failed: The private action did not complete. Use Take over.' : this.privacy.text('');
+    return { output, ...(privateLiveViewUrl ? { privateLiveViewUrl } : {}) } as T;
+  }
+
+  async prepareCredential(originInput: string, fieldInput: string) {
+    return this.queueBrowser(async () => {
+      const origin = exactOrigin(originInput), field = credentialField(fieldInput), generation = this.controlGeneration;
+      if (this.humanHasBrowser() || this.credentialOrigin() && this.credentialOrigin() !== origin) throw guardFailure();
+      for (const c of this.credentialChallenges.values()) await c.target.close();
+      this.credentialChallenges.clear();
+      const stored = this.browserState();
+      const browser = await this.connectBrowser(stored.sessionId);
+      const context = browser.contexts()[0];
+      const page = context?.pages().at(-1);
+      if (!page || this.humanHasBrowser() || generation !== this.controlGeneration) throw guardFailure();
+      this.saveBrowserState(browser.sessionId(), new Set(stored.allowedHosts), '', '');
+      await this.installNetworkBoundary(context!, new Set(stored.allowedHosts), false);
+      const target = await PreparedCredential.create(page, origin, field);
+      if (this.humanHasBrowser() || generation !== this.controlGeneration || context!.pages().at(-1) !== page) { await target.close(); throw guardFailure(); }
+      const challenge = crypto.randomUUID().replaceAll('-', '');
+      const expiresAt = Date.now() + 60_000;
+      this.credentialChallenges.set(challenge, { target, page, sessionId: browser.sessionId(), generation, expiresAt, origin, field });
+      return { ...vaultCapabilities(), challenge, expiresAt, origin, field };
+    });
+  }
+  async fillCredential(challenge: string, origin: string, field: string, value: string) {
+    return this.queueBrowser(async () => {
+      const c = this.credentialChallenges.get(challenge);
+      this.credentialChallenges.delete(challenge); // never retry or replay a value transfer
+      if (!c) throw guardFailure();
+      try {
+        if (c.origin !== origin || c.field !== field || c.expiresAt <= Date.now() || c.generation !== this.controlGeneration || this.humanHasBrowser()) throw guardFailure();
+        const browser = this.browserConnection;
+        if (!browser || browser.sessionId !== c.sessionId || browser.browser.contexts()[0]?.pages().at(-1) !== c.page) throw guardFailure();
+        // No await between the final control check and dispatch. Takeover waits for browserQueue.
+        this.markCredential(value, origin);
+        await c.target.fill(value);
+        return { ...vaultCapabilities(), ok: true, filled: true, challenge };
+      } catch { throw guardFailure(); }
+      finally { await c.target.close(); }
+    });
+  }
   private readonly automation = new BrowserAutomation();
   private liveView?: LiveViewCache;
   private controlGeneration=0;
@@ -78,6 +142,9 @@ export class GratisSandbox extends Sandbox<Env> {
     this.gratisEnv = env;
     ctx.blockConcurrencyWhile(async () => {
       this.ctx.storage.sql.exec(`
+        CREATE TABLE IF NOT EXISTS credential_privacy (
+          singleton INTEGER PRIMARY KEY CHECK(singleton=1), origin TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS action_receipts (
           action_id TEXT PRIMARY KEY,
           argument_digest TEXT NOT NULL,
@@ -103,6 +170,7 @@ export class GratisSandbox extends Sandbox<Env> {
           updated_at INTEGER NOT NULL
         );
       `);
+      this.privacy = new CredentialPrivacy(!!this.credentialOrigin());
       const columns = this.ctx.storage.sql.exec<{ name: string }>("PRAGMA table_info(action_receipts)").toArray();
       if (!columns.some((column) => column.name === "visual_artifact_json")) {
         this.ctx.storage.sql.exec("ALTER TABLE action_receipts ADD COLUMN visual_artifact_json TEXT");
@@ -182,6 +250,7 @@ export class GratisSandbox extends Sandbox<Env> {
       }
       await within('finishing the last browser action',15000,()=>action.promise).catch(error=>{if(this.browserMutation===action)throw error;});
     }
+    if(human) await this.browserQueue.catch(() => {});
     return{human:this.humanHasBrowser()};
   }
 
@@ -191,6 +260,12 @@ export class GratisSandbox extends Sandbox<Env> {
     networkAllowlist: string[],
     humanControl = false,
     approvedTarget = false,
+  ): Promise<BrowserActionResult> {
+    return this.queueBrowser(async () => this.protectResult(await this.performBrowserAction(name,args,networkAllowlist,humanControl,approvedTarget)));
+  }
+
+  private async performBrowserAction(
+    name: BrowserToolName, args: Record<string, unknown>, networkAllowlist: string[], humanControl = false, approvedTarget = false,
   ): Promise<BrowserActionResult> {
     const generation=this.controlGeneration;
     if(!humanControl&&this.humanHasBrowser())throw new Error('The user has control of the browser. Wait for them to give control back.');
@@ -222,7 +297,7 @@ export class GratisSandbox extends Sandbox<Env> {
     const beforePages = context.pages().length;
     const passive=['browse_url','inspect_page','capture_screen','open_application'].includes(name);
     const beforeDialogs = passive?0:await step('dialog inspection',1500,()=>page.locator("dialog,[role='dialog'],[aria-modal='true']").count()).catch(() => 0);
-    const beforeFingerprint = passive?'0'.repeat(64):await step('before fingerprint',1500,()=>this.automation.fingerprint(page)).catch(() => '0'.repeat(64));
+    const beforeFingerprint = passive||this.privacy.latched?'0'.repeat(64):await step('before fingerprint',1500,()=>this.automation.fingerprint(page)).catch(() => '0'.repeat(64));
 
     if(!humanControl&&(this.humanHasBrowser()||generation!==this.controlGeneration))throw new Error('Browser action paused for manual control.');
     let actionDetail = "Captured the cloud browser.";
@@ -296,6 +371,10 @@ export class GratisSandbox extends Sandbox<Env> {
     try{await primitive;}finally{if(this.browserMutation===mutation)this.browserMutation=undefined;}
     if(!humanControl&&(this.humanHasBrowser()||generation!==this.controlGeneration))throw new Error('Browser action paused for manual control.');
 
+    if (this.privacy.latched) {
+      const privateLiveViewUrl = await this.browserLiveViewUrl(page,browser.sessionId()).catch(() => undefined);
+      return { output: this.privacy.text(''), ...(privateLiveViewUrl ? { privateLiveViewUrl } : {}) };
+    }
     if(!effectOverride&&!passive)await step('settle',3000,()=>this.automation.waitForChange(page,beforeFingerprint)).catch(()=>warnings.push('The page is still changing. Inspect again before repeating an action.'));
     page = context.pages().at(-1) ?? page;
     await step('viewport',2000,()=>page.setViewportSize({ width: BROWSER_WIDTH, height: BROWSER_HEIGHT }));
@@ -303,11 +382,11 @@ export class GratisSandbox extends Sandbox<Env> {
     warnings.push(...(observation.warnings||[]));if(warnings.length)observation.warnings=[...new Set(warnings)];
     const currentUrl = page.url();
     const pageTitle = observation.title||this.fallbackTitle(currentUrl);
-    const screenshot = await step('capture',8000,()=>captureResponsive(page));
-    if (!screenshot.length || screenshot.length > MAX_FRAME_BYTES) throw new Error("The cloud browser returned an invalid or oversized frame");
-    const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", screenshot));
+    const screenshot = this.privacy.latched ? undefined : await step('capture',8000,()=>captureResponsive(page));
+    if (screenshot && (!screenshot.length || screenshot.length > MAX_FRAME_BYTES)) throw new Error("The cloud browser returned an invalid or oversized frame");
+    const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", screenshot ?? new Uint8Array()));
     const liveViewUrl = await step('live view',1500,()=>this.browserLiveViewUrl(page,browser.sessionId())).catch(()=>undefined);
-    const visualArtifact: BrowserVisualArtifact = {
+    const visualArtifact: BrowserVisualArtifact | undefined = screenshot ? {
       mimeType: "image/png",
       dataBase64: this.base64(screenshot),
       sha256: [...digest].map((byte) => byte.toString(16).padStart(2, "0")).join(""),
@@ -316,7 +395,7 @@ export class GratisSandbox extends Sandbox<Env> {
       width: BROWSER_WIDTH,
       height: BROWSER_HEIGHT,
       ...(liveViewUrl ? { liveViewUrl } : {}),
-    };
+    } : undefined;
     const afterDialogs = observation.dialogs;
     const afterFingerprint = observation.fingerprint;
     const effect: BrowserActionOutcome["effect"] = effectOverride
@@ -348,10 +427,16 @@ export class GratisSandbox extends Sandbox<Env> {
       observation.visibleText ? `\nVisible text:\n${observation.visibleText}` : "\nNo readable page text was found.",
     ].join("\n");
     console.log(JSON.stringify({kind:'gratis_browser',action:name,stage:'complete',ms:Date.now()-started,partial:!!warnings.length,elements:observation.elements.length}));
-    return { output, visualArtifact, browserObservation: observation, browserOutcome };
+    return { output, visualArtifact, browserObservation: observation, browserOutcome, ...(this.privacy.latched && liveViewUrl ? { privateLiveViewUrl:liveViewUrl } : {}) };
   }
 
   async disposeBrowser(): Promise<void> {
+    this.ctx.storage.sql.exec("UPDATE browser_control SET human=1 WHERE singleton=1"); this.controlGeneration++;
+    return this.queueBrowser(() => this.disposePrivateBrowser());
+  }
+  private async disposePrivateBrowser(): Promise<void> {
+    for (const c of this.credentialChallenges.values()) await c.target.close();
+    this.credentialChallenges.clear();
     this.ctx.storage.sql.exec("UPDATE browser_control SET human=0 WHERE singleton=1");this.controlGeneration++;
     this.liveView=undefined;
     const {sessionId}=this.browserState();
@@ -359,6 +444,8 @@ export class GratisSandbox extends Sandbox<Env> {
     this.browserConnection=undefined;
     // Forget a failed connection even if its remote Chromium cannot acknowledge close.
     this.ctx.storage.sql.exec("DELETE FROM browser_state WHERE singleton = 1");
+    this.ctx.storage.sql.exec("DELETE FROM credential_privacy WHERE singleton = 1");
+    this.privacy = new CredentialPrivacy();
     if(sessionId){
       try{await within('close browser',5000,async()=>{
         browser??=await connect(this.gratisEnv.BROWSER,sessionId);
@@ -391,8 +478,8 @@ export class GratisSandbox extends Sandbox<Env> {
          current_url = excluded.current_url, page_title = excluded.page_title, updated_at = excluded.updated_at`,
       sessionId,
       JSON.stringify([...allowedHosts].slice(-100)),
-      currentUrl.slice(0, 4_000),
-      pageTitle.slice(0, 240),
+      this.privacy.text(currentUrl).slice(0, 4_000),
+      this.privacy.text(pageTitle).slice(0, 240),
       Date.now(),
     );
   }
@@ -435,6 +522,8 @@ export class GratisSandbox extends Sandbox<Env> {
       if(/^(?:data|blob|about):/i.test(value)){await route.continue();return;}
       let url:URL;
       try{url=browserResourceUrl(value);}catch{await route.abort('blockedbyclient');return;}
+      const credentialOrigin=this.credentialOrigin();
+      if(credentialOrigin && url.origin!==credentialOrigin){await route.abort('blockedbyclient');return;}
       const frame=request.frame(),mainNavigation=request.isNavigationRequest()&&frame===frame.page().mainFrame();
       if(mainNavigation&&!policy.approved&&!this.humanHasBrowser()&&!this.hostAllowed(url.hostname,policy.hosts)){await route.abort('blockedbyclient');return;}
       await route.continue();

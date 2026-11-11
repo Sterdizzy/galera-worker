@@ -1,3 +1,4 @@
+import { vaultCapabilities, exactOrigin, credentialField } from './vault-guard';
 import { getSandbox } from "@cloudflare/sandbox";
 import { GratisControl } from "./control";
 import { boundedJson } from "./http";
@@ -258,13 +259,14 @@ async function handleExecute(body: Record<string, unknown>, device: AuthorizedDe
   const claim = await sandbox.claimAction(request.auditContext.actionId, computedDigest, Date.now());
   if (claim.kind === "conflict") return json({ error: "Action ID was already claimed for different arguments", receiptId: claim.receiptId }, 409);
   if (claim.kind === "in-flight") return json({ error: "This action is already in flight; its outcome is not yet known", receiptId: claim.receiptId }, 409);
-  if (claim.kind === "replay") return json({ ...claim.result, receiptId: claim.receiptId, replayed: true });
+  if (claim.kind === "replay") return json({ ...await sandbox.protectResult(claim.result), argumentDigest:computedDigest, receiptId: claim.receiptId, replayed: true });
   let result: BrowserActionResult;
   try {
     result = await executeTool(sandbox, request);
   } catch (error) {
     result = { output: `Sandbox action failed: ${error instanceof Error ? error.message : "unknown execution error"}` };
   }
+  result = await sandbox.protectResult(result);
   result.output = trimmedOutput(result.output);
   const storedVisualArtifact: StoredBrowserVisualArtifact | undefined = result.visualArtifact ? {
     mimeType: result.visualArtifact.mimeType,
@@ -288,6 +290,27 @@ async function handleExecute(body: Record<string, unknown>, device: AuthorizedDe
   return json({ ...result, argumentDigest: computedDigest, receiptId: claim.receiptId });
 }
 
+async function handleVault(path: string, body: Record<string, unknown>, device: AuthorizedDevice, env: Env): Promise<Response> {
+  try {
+    if (path === '/vault/capabilities') {
+      if (Object.keys(body).length) throw new Error();
+      return json(vaultCapabilities());
+    }
+    if (path !== '/vault/prepare' && path !== '/vault/fill') return json({ error:'Not found' },404);
+    const filling = path === '/vault/fill';
+    const allowed = ['conversationId','agentComputerId','expectedOrigin','field', ...(filling ? ['challenge','value'] : [])];
+    if (Object.keys(body).some((k) => !allowed.includes(k))) throw new Error();
+    const conversationId=body.conversationId, agentComputerId=body.agentComputerId;
+    if (typeof conversationId!=='string' || !/^[a-zA-Z0-9:_-]{8,160}$/.test(conversationId) || typeof agentComputerId!=='string' || !/^[a-zA-Z0-9:_-]{8,160}$/.test(agentComputerId)) throw new Error();
+    const origin=exactOrigin(body.expectedOrigin), field=credentialField(body.field);
+    const hash=await sha256Hex(`${device.deviceId}\n${conversationId}\n${agentComputerId}`);
+    const sandbox=getSandbox(env.Sandbox,sandboxIdFor(conversationId,agentComputerId,hash),{normalizeId:true,sleepAfter:'5m',keepAlive:false});
+    if (!filling) return json(await sandbox.prepareCredential(origin,field));
+    if (typeof body.challenge!=='string' || !/^[a-zA-Z0-9_-]{16,160}$/.test(body.challenge) || typeof body.value!=='string' || !body.value.length || body.value.length>8000 || body.value.includes('\0')) throw new Error();
+    return json(await sandbox.fillCredential(body.challenge,origin,field,body.value));
+  } catch { return json({ error:'The credential target could not be verified.' },409); }
+}
+
 export default {
  async fetch(request: Request, env: Env): Promise<Response> {
   const url=new URL(request.url);
@@ -295,10 +318,11 @@ export default {
    if(request.method==='GET'&&url.pathname==='/start')return new Response(`<!doctype html><html><head><meta charset="utf-8"><title>Gratis computer</title><style>html{color-scheme:dark}body{margin:0;background:#121212;color:#f0f0f0;font:20px system-ui;min-height:100vh;display:grid;place-items:center;text-align:center}main{max-width:580px;padding:40px}i{font-style:normal;font-size:58px}h1{font-size:34px;font-weight:550;letter-spacing:-1px}p{color:#a0a0a0;line-height:1.6}</style></head><body><main><i>◉</i><h1>Your computer is ready</h1><p>Ask your bot to browse, research, or work with files.<br>You can also open a website using the address bar.</p></main></body></html>`,{headers:{'Content-Type':'text/html; charset=utf-8','Cache-Control':'no-store','Content-Security-Policy':"default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'"}});
    if(request.method==='GET'&&url.pathname==='/health')return json({ok:true,service:'gratis-cloud',protocolVersion:2,capabilities:gatewayCapabilities});
    if(request.method!=='POST')return json({error:'Not found'},404);
-   const body=await boundedJson(request);
+   const body=await boundedJson(request,url.pathname.startsWith('/vault/') ? 24_000 : undefined);
    if(url.pathname==='/pair')return handlePair(body,env);
    const device=await authorizeDevice(request,env);
    if(!device)return json({error:'Computer authentication failed'},401);
+   if(url.pathname.startsWith('/vault/'))return handleVault(url.pathname,body,device,env);
    if(url.pathname==='/heartbeat')return json({ok:true,protocolVersion:2,capabilities:gatewayCapabilities});
    if(url.pathname==='/execute')return handleExecute(body,device,env);
    if(url.pathname==='/dispose'||url.pathname==='/restart-browser'||url.pathname==='/browser-control'){
@@ -311,6 +335,6 @@ export default {
     await sandbox.disposeBrowser().catch(()=>undefined);if(url.pathname==='/dispose')await sandbox.destroy();return json({ok:true});
    }
    return json({error:'Not found'},404);
-  }catch(error){return json({error:error instanceof Error?error.message:'Computer request failed'},400);}
+  }catch(error){return json({error:url.pathname.startsWith('/vault/') ? 'The credential request could not be completed.' : error instanceof Error?error.message:'Computer request failed'},400);}
  }
 } satisfies ExportedHandler<Env>;

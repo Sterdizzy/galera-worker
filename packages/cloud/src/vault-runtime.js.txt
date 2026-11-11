@@ -1,0 +1,71 @@
+function credentialRuntime() {
+  const doc = document;
+  const attr = Element.prototype.getAttribute;
+  const query = Document.prototype.querySelectorAll;
+  const connected = Object.getOwnPropertyDescriptor(Node.prototype, "isConnected").get;
+  const inputForm = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "form").get;
+  const inputType = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "type").get;
+  const formAction = Object.getOwnPropertyDescriptor(HTMLFormElement.prototype, "action").get;
+  const formMethod = Object.getOwnPropertyDescriptor(HTMLFormElement.prototype, "method").get;
+  const formTarget = Object.getOwnPropertyDescriptor(HTMLFormElement.prototype, "target").get;
+  const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set;
+  const rectOf = Element.prototype.getBoundingClientRect;
+  const matches = Element.prototype.matches;
+  const visibility = Element.prototype.checkVisibility;
+  let saved;
+  const fail = () => {
+    throw new Error("Credential target changed.");
+  };
+  const signature = (input) => [inputType.call(input), attr.call(input, "name"), attr.call(input, "id"), attr.call(input, "autocomplete"), attr.call(input, "form")].join("|");
+  const eligible = (input, field) => {
+    const type = inputType.call(input);
+    const tokens = (attr.call(input, "autocomplete") || "").trim().toLowerCase().split(/\s+/);
+    const autocomplete = tokens.at(-1) || "";
+    if (tokens.includes("new-password")) return false;
+    if (field === "password") return type === "password" && autocomplete !== "one-time-code";
+    if (field === "totp") return autocomplete === "one-time-code" && ["text", "tel", "password", "number"].includes(type);
+    return autocomplete === "username" && ["text", "email", "tel"].includes(type) || type === "email" && autocomplete !== "one-time-code";
+  };
+  const inspect = (origin, field) => {
+    if (document !== doc || window !== window.top || globalThis.origin !== origin || new URL(doc.URL).origin !== origin || new URL(doc.URL).protocol !== "https:" || doc.domain !== new URL(doc.URL).hostname) return fail();
+    const candidates = [...query.call(doc, "input")].filter((node) => node instanceof HTMLInputElement && eligible(node, field));
+    if (candidates.length !== 1) return fail();
+    const input = candidates[0];
+    const form = inputForm.call(input);
+    if (!form || !connected.call(input) || !connected.call(form) || input.ownerDocument !== doc || form.ownerDocument !== doc) return fail();
+    if (matches.call(input, ":disabled") || input.readOnly || !visibility || !visibility.call(input, { checkOpacity: true, checkVisibilityCSS: true })) return fail();
+    const rect = rectOf.call(input);
+    const x = rect.x + rect.width / 2, y = rect.y + rect.height / 2;
+    if (rect.width <= 0 || rect.height <= 0 || x < 0 || y < 0 || x >= innerWidth || y >= innerHeight || doc.elementFromPoint(x, y) !== input) return fail();
+    const action = formAction.call(form);
+    const url = new URL(action);
+    if (url.origin !== origin || url.username || url.password || url.hash || formMethod.call(form) !== "post" || !["", "_self"].includes(formTarget.call(form))) return fail();
+    for (const control of query.call(doc, "button,input")) {
+      if (!(control instanceof HTMLInputElement || control instanceof HTMLButtonElement) || control.form !== form) continue;
+      const override = attr.call(control, "formaction");
+      if (override !== null && new URL(override, doc.baseURI).origin !== origin) return fail();
+      const method = attr.call(control, "formmethod");
+      if (method !== null && method.toLowerCase() !== "post") return fail();
+      const target = attr.call(control, "formtarget");
+      if (target !== null && !["", "_self"].includes(target)) return fail();
+    }
+    return { input, form, signature: signature(input), action, origin, field };
+  };
+  return {
+    prepare(origin, field) {
+      saved = inspect(origin, field);
+      return { ok: true };
+    },
+    fill(value) {
+      if (!saved) return fail();
+      const current = inspect(saved.origin, saved.field);
+      const previous = saved;
+      saved = void 0;
+      if (current.input !== previous.input || current.form !== previous.form || current.signature !== previous.signature || current.action !== previous.action) return fail();
+      setter.call(current.input, value);
+      current.input.dispatchEvent(new Event("input", { bubbles: true }));
+      current.input.dispatchEvent(new Event("change", { bubbles: true }));
+      return { ok: true };
+    }
+  };
+}
