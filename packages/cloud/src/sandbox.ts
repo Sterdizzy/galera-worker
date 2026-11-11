@@ -444,8 +444,8 @@ export class GratisSandbox extends Sandbox<Env> {
     this.browserConnection=undefined;
     // Forget a failed connection even if its remote Chromium cannot acknowledge close.
     this.ctx.storage.sql.exec("DELETE FROM browser_state WHERE singleton = 1");
-    this.ctx.storage.sql.exec("DELETE FROM credential_privacy WHERE singleton = 1");
-    this.privacy = new CredentialPrivacy();
+    // A browser reset does not destroy sandbox files or drain outstanding command/file
+    // operations. Keep the durable privacy latch for the entire seat lifetime.
     if(sessionId){
       try{await within('close browser',5000,async()=>{
         browser??=await connect(this.gratisEnv.BROWSER,sessionId);
