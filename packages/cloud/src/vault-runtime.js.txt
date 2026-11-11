@@ -16,7 +16,7 @@ function credentialRuntime() {
   const fail = () => {
     throw new Error("Credential target changed.");
   };
-  const signature = (input) => [inputType.call(input), attr.call(input, "name"), attr.call(input, "id"), attr.call(input, "autocomplete"), attr.call(input, "form")].join("|");
+  const signature = (input) => JSON.stringify([inputType.call(input), attr.call(input, "name"), attr.call(input, "id"), attr.call(input, "autocomplete"), attr.call(input, "form")]);
   const eligible = (input, field) => {
     const type = inputType.call(input);
     const tokens = (attr.call(input, "autocomplete") || "").trim().toLowerCase().split(/\s+/);
