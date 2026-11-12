@@ -6,21 +6,31 @@ This fork adds the credential guard used by [Galera](https://github.com/Sterdizz
 
 Authenticated clients prepare a field before reading a secret. Preparation returns a single-use challenge, valid for 60 seconds, bound to the device-owned seat, current page, document, input, form and control generation. Filling rechecks everything in one synchronous browser task inside a CDP isolated world. The native setter bypasses page prototype replacements.
 
-The guard requires an exact HTTPS security origin, an unambiguous visible and enabled top-document input, and a same-origin POST form. Password fields exclude new-password controls. Two-factor fields require the one-time-code autocomplete token. Username fields require username autocomplete or email input type. Changed nodes, form actions, submit overrides, frame targets, documents, origins, expired challenges and replay are refused. It neither navigates nor submits the form.
+The guard requires an exact HTTPS security origin, an unambiguous visible and enabled top-document input, and a same-origin POST form. Password fields exclude new-password controls. Two-factor fields require the one-time-code autocomplete token. Username fields require username autocomplete or email input type. Changed nodes, form actions, submit overrides, frame targets, documents, origins, expired challenges and replay are refused.
 
-Prepare, fill, ordinary browser actions and disposal share a seat queue. Human takeover changes its generation immediately and waits for in-flight work before acknowledging control. An earlier failed operation cannot make that acknowledgement fail.
+`/vault/fill` accepts an optional boolean `submit`. With `submit: true` the Worker writes the value, lets page input handlers run, then reruns every preparation check on the same control and form and submits that form with the native `requestSubmit`, using the form's first enabled submit button. It then waits up to 8 seconds for a main-frame navigation or for the filled control to leave the page. The response adds `submitted` and `stillOnForm`. `stillOnForm` is true when the filled control is still shown, or after navigation when a visible password or one-time-code field is present, such as a rejected password or a next sign-in step. Without `submit`, `submitted` is false and `stillOnForm` is true.
+
+Prepare, fill, ordinary browser actions and disposal share a seat queue. Human takeover changes its generation immediately and waits for in-flight work before acknowledging control. A takeover that lands between the write and the submit refuses the submit. An earlier failed operation cannot make that acknowledgement fail.
 
 The browser runtime is a text asset so Wrangler cannot introduce closure-dependent compiler helpers into the isolated world. Tests exercise that asset in real Chromium.
 
-## Content secrecy
+## Fill window
 
-Before setting a credential, the Durable Object persists a latch containing only the public origin. It stores no password, two-factor code, setup key or digest of a low-entropy secret. Once latched, Bot-visible content and screenshots are suppressed for the entire sandbox seat lifetime, including later actions, files, errors and receipt replays. Page-derived content is not collected for subsequent browser observations, and screenshots are not captured. A page can encode a secret arbitrarily, so string replacement is not the security boundary.
+Capability `vault.fill_login_guarded.v2` (implementation `galera-vault-2026-11-12.1`) reports `privacy: "fill-window"`. A short, in-memory privacy window replaces the v1 latch. It opens when a preparation succeeds and holds until the fill completes, and with `submit` until the page settles. While it is open, every Bot-visible browser observation, screenshot, command, file result and receipt replay for that seat returns `Sandbox action failed: Signing in, try again in a moment.` Browser actions are refused at once rather than queued behind the fill.
 
-This deliberately limits autonomous browsing after login. The authenticated human live viewer remains available, and further saved fields can still be filled by reference. Restarting the browser closes the old browser but retains the latch because sandbox files and outstanding commands can retain credential content. A fresh Bot with a separate sandbox is required for public observations. A cold Durable Object retains content suppression without needing any secret in storage. Direct requests to another origin are refused while the credential session is active. The approved site itself necessarily receives the filled credential and is trusted with it.
+The window never blocks indefinitely. It ends when the fill completes or fails, when the challenge expires (60 seconds), on takeover, on browser reset, and on a cold start, because nothing is persisted. After a successful fill the Bot sees the page again, including the signed-in page after a submit. Password and one-time-code values stay redacted in semantic observations.
+
+When anything fails after the value may have been written (validation, a changed form before submit, takeover before submit, a submit error or a timeout), the Worker clears the filled controls and the credential controls of their forms before the window ends. A submit that was already dispatched is not undone.
+
+The value never appears in a response, error or log, and is not stored. The approved site receives the filled credential and is trusted with it.
+
+### Accepted risk
+
+Decided by the owner on 2026-11-12. A script on the approved origin can read a filled password, and once the window ends the Bot can observe whatever that page shows, including signed-in content and anything the page derives from the credential. Seats latched by v1 are released by v2: the `credential_privacy` table is dropped on the next start, so their retained pages and sandbox files become observable again. The cross-origin request block that v1 applied for the seat lifetime is also removed, since post-login redirects and API calls routinely leave the form's origin.
 
 ## Verification
 
-Run the cloud package typecheck and unit tests using installed dependencies. Galera's explicit cross-repository test uses the real Worker fetch handler, SQLite statements, browser implementation and Chromium; only the Cloudflare transport is local. It checks authenticated approval-to-fill, stale origins and nodes, changed forms, duplicate fields, takeover ordering, replay, prototype tampering, encoded page echoes, cold starts, content suppression and persisted receipts.
+Run the cloud package typecheck and unit tests using installed dependencies. Galera's explicit cross-repository test uses the real Worker fetch handler, SQLite statements, browser implementation and Chromium; only the Cloudflare transport is local. For v2 it checks the capability, release of a v1 latch, refusal during the window and in-flight fills, recovery after success, expiry and takeover, validated submit and settle, `stillOnForm`, clearing after a failed submit, stale origins and nodes, changed forms, duplicate fields, takeover ordering, replay, prototype tampering, cold starts and the absence of the value from responses, logs and persisted receipts.
 
 ```sh
 node tests/vault-worker-e2e.mjs /path/to/galera-worker/packages/cloud /path/to/installed/chrome
@@ -32,4 +42,21 @@ That command runs from the Galera repository. It uses synthetic credentials and 
 
 Use `wrangler.galera.jsonc` and explicitly select the verified account through `CLOUDFLARE_ACCOUNT_ID`. The configuration keeps the existing remote image, `lite` size, maximum two instances, class names, bindings and migration tag `v1`. Upload a version with `--keep-vars --strict`, inspect its resource metadata against the current version, then activate that exact version. Version upload and activation avoid container builds, container rollouts and route changes. Never pass a secrets file or replace existing secret values.
 
-The captured rollback baseline is Worker version `b887ad0b-1c63-4410-9db4-89a03e0fa901`. Before activation, confirm that it is still the deployed baseline. Additive SQL tables survive a code rollback. During verification, destroy every synthetic credential-bearing sandbox before reverting to a pre-guard version. After real users adopt guarded filling, a rollback must retain the privacy boundary or destroy affected sandboxes first; reverting to old code alone could expose a retained page.
+The v1 guard runs as Worker version `27c7acd3-9c25-423b-97f1-63ab05ed30b2`; the pre-guard rollback baseline is `b887ad0b-1c63-4410-9db4-89a03e0fa901`. Before activation, confirm that `27c7acd3` is still the active version. Additive SQL tables survive a code rollback. During verification, destroy every synthetic credential-bearing sandbox before reverting to a pre-guard version. Rolling v2 back to v1 recreates an empty latch table, so seats filled under v2 stay observable under v1 until their next fill. Rolling back to the pre-guard version removes the vault endpoints; Galera then fails closed because the capability is missing.
+
+## Rollout attempt, 2026-11-12 (rolled back)
+
+v2 (`066caa1`) was uploaded with `wrangler.galera.jsonc`, `--keep-vars --strict` and an explicit account ID, as Worker version `4c98426e-286d-4ace-9038-9e9a4dab6cac`. No secrets file, container rollout, route or DNS change was used. Its metadata matched the active `27c7acd3-9c25-423b-97f1-63ab05ed30b2`. The match covered both Durable Object namespace IDs, the secret binding names, compatibility date and flags, migration tag `v1`, and the container class and name. Only the script hash differed. The version was activated at 100% and `/health` answered.
+
+Galera's live verifier (`tests/live-vault-worker.mjs verify`) did not run. It reads the device token from `cloud_config.token`, but Galera now keeps that token in the Mac Keychain and the column is empty. The verifier stopped before contacting the Worker. Without a passing verification, `27c7acd3` was reactivated at 100% about three minutes later. During that time any v1-latched seat whose Durable Object started on v2 lost its latch table.
+
+
+## Verified rollout, 2026-11-12
+
+Galera's live verifier now reads the paired device token the way the server does. It uses the single Keychain item `GALERA_CLOUD_TOKEN:<origin>` through Galera's keychain module, and `GALERA_CLOUD_TOKEN` overrides it (Galera `dfbd3a6`). It opens the Galera DB read-only for the Worker URL. The token is never printed, logged or stored.
+
+- `preflight` against `27c7acd3` passed: a synthetic seat, a live CDP fixture, no real login. The first attempt hit a Cloudflare browser `new page` timeout and still disposed its seat.
+- `4c98426e-286d-4ace-9038-9e9a4dab6cac` was reactivated at 100% at 13:04 UTC.
+- `verify` passed in 17 seconds: `{"guardedActualGaleraApproval":true,"liveSignInSubmitted":true,"changedFormAndTakeoverRefused":true,"screenshotsReturnAfterFill":true,"syntheticCredentialsOnly":true}`. It used a synthetic seat, a synthetic login, the real Galera approval path and fill-with-submit, and it destroyed its seat.
+
+Active version: `4c98426e-286d-4ace-9038-9e9a4dab6cac`. Rollback target: `27c7acd3-9c25-423b-97f1-63ab05ed30b2` (v1 guard). v1-latched seats were released in two windows: about three minutes during the earlier attempt, and continuously since 13:04 UTC.

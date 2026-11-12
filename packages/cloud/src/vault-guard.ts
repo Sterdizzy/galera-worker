@@ -1,10 +1,10 @@
 import credentialRuntimeSource from './vault-runtime.js.txt';
 import type { Page } from '@cloudflare/playwright';
 
-export const VAULT_CAPABILITY = 'vault.fill_login_guarded.v1';
-export const VAULT_IMPLEMENTATION = 'galera-vault-2026-11-11.1';
+export const VAULT_CAPABILITY = 'vault.fill_login_guarded.v2';
+export const VAULT_IMPLEMENTATION = 'galera-vault-2026-11-12.1';
 export type CredentialField = 'username' | 'password' | 'totp';
-export const vaultCapabilities = () => ({ capability: VAULT_CAPABILITY, implementation: VAULT_IMPLEMENTATION, privacy: 'content-hidden' });
+export const vaultCapabilities = () => ({ capability: VAULT_CAPABILITY, implementation: VAULT_IMPLEMENTATION, privacy: 'fill-window' });
 export const guardFailure = () => new Error('The credential target could not be verified.');
 
 export function exactOrigin(value: unknown): string {
@@ -32,7 +32,7 @@ export class PreparedCredential {
       cdp = await page.context().newCDPSession(page) as unknown as Session;
       const tree = await cdp.send('Page.getFrameTree');
       if (new URL(tree.frameTree.frame.url).origin !== origin) throw guardFailure();
-      const world = await cdp.send('Page.createIsolatedWorld', { frameId: tree.frameTree.frame.id, worldName: 'galera-vault-v1' });
+      const world = await cdp.send('Page.createIsolatedWorld', { frameId: tree.frameTree.frame.id, worldName: 'galera-vault-v2' });
       const installed = await cdp.send('Runtime.evaluate', { expression: `(${credentialRuntimeSource})()`, contextId: world.executionContextId, returnByValue: false, silent: true });
       if (installed.exceptionDetails || !installed.result?.objectId) throw guardFailure();
       const result = await cdp.send('Runtime.callFunctionOn', { objectId: installed.result.objectId, functionDeclaration: 'function(origin, field) { return this.prepare(origin, field); }', arguments: [{ value: origin }, { value: field }], returnByValue: true, silent: true });
@@ -40,12 +40,26 @@ export class PreparedCredential {
       return new PreparedCredential(cdp, installed.result.objectId);
     } catch { await cdp?.detach().catch(() => {}); throw guardFailure(); }
   }
+  private async call(declaration: string, args: unknown[] = []): Promise<Record<string, unknown>> {
+    const result = await this.cdp.send('Runtime.callFunctionOn', { objectId: this.objectId, functionDeclaration: declaration, arguments: args.map((value) => ({ value })), returnByValue: true, silent: true });
+    if (result.exceptionDetails || result.result?.value?.ok !== true) throw guardFailure();
+    return result.result.value;
+  }
+  /** Writes the value after revalidating the prepared control. The caller owns close(). */
   async fill(value: string): Promise<void> {
-    try {
-      const result = await this.cdp.send('Runtime.callFunctionOn', { objectId: this.objectId, functionDeclaration: 'function(value) { return this.fill(value); }', arguments: [{ value }], returnByValue: true, silent: true });
-      if (result.exceptionDetails || result.result?.value?.ok !== true) throw guardFailure();
-    } catch { throw guardFailure(); }
-    finally { await this.close(); }
+    try { await this.call('function(value) { return this.fill(value); }', [value]); } catch { throw guardFailure(); }
+  }
+  /** Revalidates the filled control and form with every preparation check, then submits that form. */
+  async submit(): Promise<void> {
+    try { await this.call('function() { return this.submit(); }'); } catch { throw guardFailure(); }
+  }
+  /** Whether the prepared document still shows a filled control. Throws once the document is gone. */
+  async present(): Promise<boolean> {
+    return (await this.call('function() { return this.present(); }')).present === true;
+  }
+  /** Clears filled controls and their forms' credential controls, if the document still exists. */
+  async clear(): Promise<void> {
+    await this.call('function() { return this.clear(); }').catch(() => {});
   }
   async close() { await this.cdp.send('Runtime.releaseObject', { objectId: this.objectId }).catch(() => {}); await this.cdp.detach().catch(() => {}); }
 }
