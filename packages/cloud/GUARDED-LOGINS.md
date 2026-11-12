@@ -50,4 +50,13 @@ v2 (`066caa1`) was uploaded with `wrangler.galera.jsonc`, `--keep-vars --strict`
 
 Galera's live verifier (`tests/live-vault-worker.mjs verify`) did not run. It reads the device token from `cloud_config.token`, but Galera now keeps that token in the Mac Keychain and the column is empty. The verifier stopped before contacting the Worker. Without a passing verification, `27c7acd3` was reactivated at 100% about three minutes later. During that time any v1-latched seat whose Durable Object started on v2 lost its latch table.
 
-To retry, the verifier needs the device token supplied without an agent reading the Keychain, for example through `GALERA_CLOUD_URL`/`GALERA_CLOUD_TOKEN` in a session Jeff runs himself. `4c98426e` can then be activated again without re-uploading.
+
+## Verified rollout, 2026-11-12
+
+Galera's live verifier now reads the paired device token the way the server does. It uses the single Keychain item `GALERA_CLOUD_TOKEN:<origin>` through Galera's keychain module, and `GALERA_CLOUD_TOKEN` overrides it (Galera `dfbd3a6`). It opens the Galera DB read-only for the Worker URL. The token is never printed, logged or stored.
+
+- `preflight` against `27c7acd3` passed: a synthetic seat, a live CDP fixture, no real login. The first attempt hit a Cloudflare browser `new page` timeout and still disposed its seat.
+- `4c98426e-286d-4ace-9038-9e9a4dab6cac` was reactivated at 100% at 13:04 UTC.
+- `verify` passed in 17 seconds: `{"guardedActualGaleraApproval":true,"liveSignInSubmitted":true,"changedFormAndTakeoverRefused":true,"screenshotsReturnAfterFill":true,"syntheticCredentialsOnly":true}`. It used a synthetic seat, a synthetic login, the real Galera approval path and fill-with-submit, and it destroyed its seat.
+
+Active version: `4c98426e-286d-4ace-9038-9e9a4dab6cac`. Rollback target: `27c7acd3-9c25-423b-97f1-63ab05ed30b2` (v1 guard). v1-latched seats were released in two windows: about three minutes during the earlier attempt, and continuously since 13:04 UTC.
