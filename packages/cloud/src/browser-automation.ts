@@ -254,7 +254,7 @@ async function rawElements(frame: Frame): Promise<RawElementObservation[]> {
       const dateHint = dateHintFor(element);
       const text = normalized(element.innerText || element.textContent);
       const type = element instanceof HTMLInputElement ? element.type.toLowerCase() : undefined;
-      const sensitive = type === "password" || /(?:password|passcode|credit.?card|security.?code|cvv)/i.test(`${name} ${element.getAttribute("autocomplete") ?? ""}`);
+      const sensitive = type === "password" || /(?:password|passcode|one-time-code|credit.?card|security.?code|cvv)/i.test(`${name} ${element.getAttribute("autocomplete") ?? ""}`);
       const rawValue = element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement || element instanceof HTMLSelectElement
         ? element.value
         : element.getAttribute("aria-valuetext") || element.getAttribute("aria-valuenow") || undefined;
@@ -318,7 +318,7 @@ export class BrowserAutomation {
       // Include visible control values and disclosure state instead.
       const formState=[...document.querySelectorAll('input,textarea,select,[aria-expanded],[aria-checked],[aria-selected]')].flatMap(node=>{
         const e=node as HTMLInputElement,rect=e.getBoundingClientRect();if(!rect.width||!rect.height||rect.bottom<0||rect.top>innerHeight)return[];
-        const sensitive=e.type==='password'||/password|passcode|credit.?card|cvv|security.?code/i.test((e.getAttribute('aria-label')||'')+' '+(e.getAttribute('autocomplete')||''));
+        const sensitive=e.type==='password'||/password|passcode|one-time-code|credit.?card|cvv|security.?code/i.test((e.getAttribute('aria-label')||'')+' '+(e.getAttribute('autocomplete')||''));
         return[[e.tagName,e.getAttribute('aria-label'),sensitive?'[redacted]':e.value,e.checked,e.getAttribute('aria-expanded'),e.getAttribute('aria-checked'),e.getAttribute('aria-selected')]];
       }).slice(0,200);
       return {

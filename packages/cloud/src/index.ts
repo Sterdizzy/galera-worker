@@ -1,4 +1,5 @@
 import { vaultCapabilities, exactOrigin, credentialField } from './vault-guard';
+import { SIGNING_IN } from './vault-privacy';
 import { getSandbox } from "@cloudflare/sandbox";
 import { GratisControl } from "./control";
 import { boundedJson } from "./http";
@@ -262,6 +263,7 @@ async function handleExecute(body: Record<string, unknown>, device: AuthorizedDe
   if (claim.kind === "replay") return json({ ...await sandbox.protectResult(claim.result), argumentDigest:computedDigest, receiptId: claim.receiptId, replayed: true });
   let result: BrowserActionResult;
   try {
+    if (await sandbox.signingIn()) throw new Error(SIGNING_IN);
     result = await executeTool(sandbox, request);
   } catch (error) {
     result = { output: `Sandbox action failed: ${error instanceof Error ? error.message : "unknown execution error"}` };
@@ -298,7 +300,7 @@ async function handleVault(path: string, body: Record<string, unknown>, device: 
     }
     if (path !== '/vault/prepare' && path !== '/vault/fill') return json({ error:'Not found' },404);
     const filling = path === '/vault/fill';
-    const allowed = ['conversationId','agentComputerId','expectedOrigin','field', ...(filling ? ['challenge','value'] : [])];
+    const allowed = ['conversationId','agentComputerId','expectedOrigin','field', ...(filling ? ['challenge','value','submit'] : [])];
     if (Object.keys(body).some((k) => !allowed.includes(k))) throw new Error();
     const conversationId=body.conversationId, agentComputerId=body.agentComputerId;
     if (typeof conversationId!=='string' || !/^[a-zA-Z0-9:_-]{8,160}$/.test(conversationId) || typeof agentComputerId!=='string' || !/^[a-zA-Z0-9:_-]{8,160}$/.test(agentComputerId)) throw new Error();
@@ -306,8 +308,8 @@ async function handleVault(path: string, body: Record<string, unknown>, device: 
     const hash=await sha256Hex(`${device.deviceId}\n${conversationId}\n${agentComputerId}`);
     const sandbox=getSandbox(env.Sandbox,sandboxIdFor(conversationId,agentComputerId,hash),{normalizeId:true,sleepAfter:'5m',keepAlive:false});
     if (!filling) return json(await sandbox.prepareCredential(origin,field));
-    if (typeof body.challenge!=='string' || !/^[a-zA-Z0-9_-]{16,160}$/.test(body.challenge) || typeof body.value!=='string' || !body.value.length || body.value.length>8000 || body.value.includes('\0')) throw new Error();
-    return json(await sandbox.fillCredential(body.challenge,origin,field,body.value));
+    if (typeof body.challenge!=='string' || !/^[a-zA-Z0-9_-]{16,160}$/.test(body.challenge) || typeof body.value!=='string' || !body.value.length || body.value.length>8000 || body.value.includes('\0') || body.submit !== undefined && typeof body.submit !== 'boolean') throw new Error();
+    return json(await sandbox.fillCredential(body.challenge,origin,field,body.value,body.submit === true));
   } catch { return json({ error:'The credential target could not be verified.' },409); }
 }
 

@@ -12,7 +12,14 @@ function credentialRuntime() {
   const rectOf = Element.prototype.getBoundingClientRect;
   const matches = Element.prototype.matches;
   const visibility = Element.prototype.checkVisibility;
-  let saved;
+  const requestSubmit = HTMLFormElement.prototype.requestSubmit;
+  const dispatch = EventTarget.prototype.dispatchEvent;
+  const NativeEvent = Event;
+  const buttonType = Object.getOwnPropertyDescriptor(HTMLButtonElement.prototype, "type").get;
+  const controlForm = Object.getOwnPropertyDescriptor(HTMLButtonElement.prototype, "form").get;
+  let saved, filled;
+  const written = [];
+  const forms = [];
   const fail = () => {
     throw new Error("Credential target changed.");
   };
@@ -51,6 +58,20 @@ function credentialRuntime() {
     }
     return { input, form, signature: signature(input), action, origin, field };
   };
+  const setValue = (input, value) => {
+    setter.call(input, value);
+    dispatch.call(input, new NativeEvent("input", { bubbles: true }));
+    dispatch.call(input, new NativeEvent("change", { bubbles: true }));
+  };
+  const same = (current, previous) => current.input === previous.input && current.form === previous.form && current.signature === previous.signature && current.action === previous.action;
+  const submitter = (form) => {
+    for (const control of query.call(doc, "button,input")) {
+      if (control instanceof HTMLButtonElement) {
+        if (controlForm.call(control) === form && buttonType.call(control) === "submit" && !matches.call(control, ":disabled")) return control;
+      } else if (control instanceof HTMLInputElement && inputForm.call(control) === form && ["submit", "image"].includes(inputType.call(control)) && !matches.call(control, ":disabled")) return control;
+    }
+    return void 0;
+  };
   return {
     prepare(origin, field) {
       saved = inspect(origin, field);
@@ -61,10 +82,40 @@ function credentialRuntime() {
       const current = inspect(saved.origin, saved.field);
       const previous = saved;
       saved = void 0;
-      if (current.input !== previous.input || current.form !== previous.form || current.signature !== previous.signature || current.action !== previous.action) return fail();
-      setter.call(current.input, value);
-      current.input.dispatchEvent(new Event("input", { bubbles: true }));
-      current.input.dispatchEvent(new Event("change", { bubbles: true }));
+      if (!same(current, previous)) return fail();
+      written.push(current.input);
+      forms.push(current.form);
+      setValue(current.input, value);
+      filled = current;
+      return { ok: true };
+    },
+    /** Revalidates the filled control and form with every preparation check, then submits it. */
+    submit() {
+      if (!filled) return fail();
+      const previous = filled;
+      filled = void 0;
+      const current = inspect(previous.origin, previous.field);
+      if (!same(current, previous)) return fail();
+      const button = submitter(current.form);
+      if (button) requestSubmit.call(current.form, button);
+      else requestSubmit.call(current.form);
+      return { ok: true };
+    },
+    /** True while this document still shows the filled control. */
+    present() {
+      if (document !== doc) return { ok: true, present: false };
+      const present = written.some((input) => connected.call(input) && input.ownerDocument === doc && (!visibility || visibility.call(input, { checkOpacity: true, checkVisibilityCSS: true })));
+      return { ok: true, present };
+    },
+    /** Clears filled controls and the credential controls of their forms. */
+    clear() {
+      const targets = new Set(written);
+      for (const form of forms) {
+        for (const node of query.call(doc, "input")) {
+          if (node instanceof HTMLInputElement && inputForm.call(node) === form && (eligible(node, "username") || eligible(node, "password") || eligible(node, "totp"))) targets.add(node);
+        }
+      }
+      for (const input of targets) if (connected.call(input)) setValue(input, "");
       return { ok: true };
     }
   };
